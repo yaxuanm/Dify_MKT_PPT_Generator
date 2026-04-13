@@ -160,6 +160,56 @@ def _new_slide(prs):
 
 
 # ============================================================
+# Dynamic font sizing helpers
+# ============================================================
+def _auto_bullet_size(bullets, font_scale=1.0, base=16, floor=8, ceil=16):
+    """Shrink bullet font when there is a lot of text in the card."""
+    if not bullets:
+        return max(floor, int(base * font_scale))
+    total_chars = sum(len(b) for b in bullets)
+    n = len(bullets)
+    if total_chars <= 120 and n <= 3:
+        size = base
+    elif total_chars <= 220 and n <= 5:
+        size = 14
+    elif total_chars <= 350 and n <= 6:
+        size = 12
+    elif total_chars <= 500:
+        size = 11
+    elif total_chars <= 700:
+        size = 10
+    else:
+        size = 9
+    return max(floor, min(ceil, int(size * font_scale)))
+
+
+def _auto_cover_title_size(title, base=72, floor=36, ceil=72):
+    """Shrink cover title for long text."""
+    n = len(title)
+    if n <= 40:
+        return ceil
+    elif n <= 60:
+        return 60
+    elif n <= 80:
+        return 52
+    elif n <= 120:
+        return 44
+    else:
+        return max(floor, 36)
+
+
+def _auto_metric_sizes(metrics, cols):
+    """Adaptive number/title/desc sizes for big_numbers based on content length."""
+    total_desc = sum(len(m.get("description", "")) for m in metrics)
+    if cols <= 2 and total_desc <= 200:
+        return 100, 22, 16
+    elif cols <= 3 and total_desc <= 400:
+        return 80, 20, 14
+    else:
+        return 64, 18, 12
+
+
+# ============================================================
 # Layout: Cards (2-6 items, auto grid)
 # ============================================================
 def _draw_card(slide, x, y, w, h, data, font_scale=1.0):
@@ -215,18 +265,20 @@ def _draw_card(slide, x, y, w, h, data, font_scale=1.0):
     r2.font.color.rgb = TITLE_DARK
     r2.font.name = "Söhne Kräftig"
 
-    bullet_size = max(12, int(16 * font_scale))
+    bullets = data.get("bullets", [])
+    bullet_size = _auto_bullet_size(bullets, font_scale)
+    bullet_spacing = max(1, min(4, int(4 * (bullet_size / 16))))
     bullet_y = y + Emu(int(1645920 * font_scale))
     bb = slide.shapes.add_textbox(x + CARD_PAD, bullet_y, w - CARD_PAD * 2, h - (bullet_y - y) - CARD_PAD)
     tf2 = bb.text_frame
     tf2.word_wrap = True
-    for i, bullet in enumerate(data.get("bullets", [])):
+    for i, bullet in enumerate(bullets):
         if i == 0:
             p = tf2.paragraphs[0]
         else:
             p = tf2.add_paragraph()
         p.space_before = Pt(0)
-        p.space_after = Pt(4)
+        p.space_after = Pt(bullet_spacing)
         r = p.add_run()
         r.text = "•  " + bullet
         r.font.size = Pt(bullet_size)
@@ -313,10 +365,8 @@ def build_big_numbers(prs, data):
     cell_w = CARD_AREA_W // cols
     cell_h = CARD_AREA_H // rows
 
-    number_size = 100 if cols <= 2 else 80 if cols == 3 else 64
+    number_size, title_size, desc_size = _auto_metric_sizes(metrics, cols)
     unit_size = int(number_size * 0.45)
-    title_size = 22 if cols <= 3 else 18
-    desc_size = 16 if cols <= 3 else 14
 
     for idx, m in enumerate(metrics[:cols * rows]):
         row = idx // cols
@@ -393,6 +443,7 @@ def build_cover(prs, data):
 
     title = data.get("title", "")
     title_blue = data.get("title_blue", "")
+    cover_size = _auto_cover_title_size(title)
 
     tb = slide.shapes.add_textbox(Emu(1222109), Emu(491817), Emu(13747191), Emu(3188971))
     tf = tb.text_frame
@@ -404,40 +455,42 @@ def build_cover(prs, data):
         if parts[0]:
             r = p.add_run()
             r.text = parts[0]
-            r.font.size = Pt(72)
+            r.font.size = Pt(cover_size)
             r.font.bold = False
             r.font.color.rgb = BLACK
             r.font.name = "Söhne Kräftig"
         r_blue = p.add_run()
         r_blue.text = title_blue
-        r_blue.font.size = Pt(72)
+        r_blue.font.size = Pt(cover_size)
         r_blue.font.bold = False
         r_blue.font.color.rgb = BLUE
         r_blue.font.name = "Söhne Kräftig"
         if len(parts) > 1 and parts[1]:
             r_after = p.add_run()
             r_after.text = parts[1]
-            r_after.font.size = Pt(72)
+            r_after.font.size = Pt(cover_size)
             r_after.font.bold = False
             r_after.font.color.rgb = BLACK
             r_after.font.name = "Söhne Kräftig"
     else:
         r = p.add_run()
         r.text = title
-        r.font.size = Pt(72)
+        r.font.size = Pt(cover_size)
         r.font.bold = False
         r.font.color.rgb = BLACK
         r.font.name = "Söhne Kräftig"
 
     subtitle = data.get("subtitle", "")
     if subtitle:
+        sub_size = 24 if len(subtitle) <= 80 else 20 if len(subtitle) <= 140 else 16
         _add_text(slide, Emu(1221068), Emu(3534821), Emu(11341057), Emu(1187451),
-                  subtitle, font_name="Söhne", size=24, color=BULLET_GRAY)
+                  subtitle, font_name="Söhne", size=sub_size, color=BULLET_GRAY)
 
     footnote = data.get("footnote", "")
     if footnote:
+        fn_size = 14 if len(footnote) <= 120 else 12 if len(footnote) <= 250 else 10
         _add_text(slide, Emu(1245121), Emu(12375667), Emu(18934803), Emu(978866),
-                  footnote, font_name="Söhne", size=14, color=SUBTITLE_GRAY)
+                  footnote, font_name="Söhne", size=fn_size, color=SUBTITLE_GRAY)
 
     return slide
 

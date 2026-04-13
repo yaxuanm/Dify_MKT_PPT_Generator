@@ -289,6 +289,13 @@ body { font-family: 'Inter', system-ui, sans-serif; background: #F2F4F7; height:
     <i>Example: "Create a slide titled 'What we do Today' with 5 product modules covering AI platform, agents, enterprise infra, observability, and multimodal data."</i>
   </div>
 </div>
+<div id="batchBar" style="padding:10px 24px;background:#FAFBFF;border-top:1px solid #E2E8F0;display:flex;align-items:center;gap:12px;">
+  <label style="padding:8px 16px;background:#1032F5;color:white;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap;">
+    Batch: Upload .pptx
+    <input type="file" id="batchInput" accept=".pptx" style="display:none" onchange="batchUpload(this)">
+  </label>
+  <span id="batchStatus" style="font-size:13px;color:#64748B;"></span>
+</div>
 <div id="imgPreview">
   <img id="previewImg" src="">
   <span id="previewLabel" style="font-size:12px;color:#64748B;">Image attached</span>
@@ -414,6 +421,32 @@ async function sendMsg() {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/\\n/g, '<br>'); }
+
+async function batchUpload(el) {
+  if (!el.files[0]) return;
+  const file = el.files[0];
+  const status = document.getElementById('batchStatus');
+  status.textContent = 'Processing ' + file.name + '...';
+  el.disabled = true;
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const res = await fetch('/api/batch', { method: 'POST', body: fd });
+    const data = await res.json();
+    const msg = document.createElement('div');
+    msg.className = 'msg bot';
+    let html = esc(data.reply || 'Done');
+    if (data.file_url) html += '<br><br><a href="' + data.file_url + '">Download branded PPTX</a>';
+    msg.innerHTML = html;
+    chat.appendChild(msg);
+    chat.scrollTop = chat.scrollHeight;
+    status.textContent = 'Done! ' + (data.reply || '');
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+  el.disabled = false;
+  el.value = '';
+}
 </script>
 </body>
 </html>"""
@@ -682,6 +715,108 @@ def api_memory_summary():
     if token and request.headers.get("X-Memory-Token") != token:
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(memory_store.memory_summary_json())
+
+
+@app.route('/api/batch', methods=['POST'])
+def batch_api():
+    """Upload a PPTX → LLM re-interprets each slide → rebuild all into one branded PPTX."""
+    try:
+        uploaded = request.files.get('file')
+        if not uploaded or not uploaded.filename.lower().endswith('.pptx'):
+            return jsonify({"reply": "Please upload a .pptx file.", "file_url": None})
+
+        upload_dir = os.path.join(os.path.dirname(__file__), 'output', 'uploads')
+        os.makedirs(upload_dir, exist_ok=True)
+        tmp_name = f"{uuid.uuid4().hex[:8]}_{uploaded.filename}"
+        tmp_path = os.path.join(upload_dir, tmp_name)
+        uploaded.save(tmp_path)
+        app.logger.info(f"[batch] file={uploaded.filename}")
+
+        src = ReadPptx(tmp_path)
+        slide_texts = []
+        for i, slide in enumerate(src.slides):
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for p in shape.text_frame.paragraphs:
+                        t = p.text.strip()
+                        if t:
+                            texts.append(t)
+            slide_texts.append(f"[Slide {i+1}]\n" + "\n".join(texts))
+
+        all_content = "\n\n".join(slide_texts)
+
+        prompt = (
+            f"Below is a {len(src.slides)}-slide presentation. "
+            f"For EACH slide, output a JSON object choosing the best layout_type. "
+            f"Return a JSON ARRAY of objects, one per slide. "
+            f"Preserve ALL original text — do not summarize, shorten or omit any content. "
+            f"Keep the exact wording from the source.\n\n"
+            f"--- Source slides ---\n{all_content[:12000]}\n--- End ---"
+        )
+
+        response = messages_create_with_fallback(
+            max_tokens=8192,
+            system=SYSTEM_PROMPT.replace(
+                "Output exactly ONE JSON object",
+                "Output a JSON ARRAY of objects, one per slide"
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        raw = response.content[0].text.strip()
+        cleaned = raw
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[1]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+        parsed = json.loads(cleaned)
+
+        if isinstance(parsed, dict):
+            slides_data = parsed.get("slides", [parsed])
+        elif isinstance(parsed, list):
+            slides_data = parsed
+        else:
+            raise ValueError("Expected JSON array or object with 'slides' key.")
+
+        from builder import build_cards, build_cover, build_big_numbers, build_case_study, SLIDE_W, SLIDE_H
+        from pptx import Presentation as NewPrs
+
+        prs = NewPrs()
+        prs.slide_width = SLIDE_W
+        prs.slide_height = SLIDE_H
+
+        builders = {
+            "cards": build_cards,
+            "big_numbers": build_big_numbers,
+            "cover": build_cover,
+            "case_study": build_case_study,
+        }
+
+        for sd in slides_data:
+            if not isinstance(sd, dict):
+                continue
+            lt = sd.get("layout_type", "cards")
+            fn = builders.get(lt, build_cards)
+            fn(prs, sd)
+
+        out_name = f"batch-{uuid.uuid4().hex[:8]}.pptx"
+        out_path = os.path.join(os.path.dirname(__file__), 'output', out_name)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        prs.save(out_path)
+
+        app.logger.info(f"[batch] OK slides={len(slides_data)} file={out_name}")
+        return jsonify({
+            "reply": f"Batch complete! {len(slides_data)} slides generated in Dify brand style.",
+            "file_url": f"/download/{out_name}",
+        })
+
+    except Exception as e:
+        app.logger.error(f"[batch] ERROR: {e}", exc_info=True)
+        return jsonify({
+            "reply": f"Batch error: {e}",
+            "file_url": None,
+        })
 
 
 @app.route('/download/<filename>')
