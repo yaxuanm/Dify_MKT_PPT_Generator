@@ -70,8 +70,52 @@ def _add_shadow(shape):
     alpha.set('val', '8000')
 
 
+def _get_shape_image_rids(shape_el):
+    """Extract all rId references from a shape's XML (blipFill, etc.)."""
+    rids = set()
+    for blip in shape_el.iter(qn('a:blip')):
+        rid = blip.get(qn('r:embed'))
+        if rid:
+            rids.add(rid)
+        rid_link = blip.get(qn('r:link'))
+        if rid_link:
+            rids.add(rid_link)
+    for img_data in shape_el.iter(qn('a:extLst')):
+        for ext in img_data.iter(qn('a:ext')):
+            for child in ext:
+                for attr in child.attrib.values():
+                    if attr.startswith('rId'):
+                        rids.add(attr)
+    return rids
+
+
+def _copy_shape_with_images(shape, ref_slide, target_slide, insert_pos=None):
+    """Deep-copy a shape element and properly re-link its embedded images."""
+    el = copy.deepcopy(shape._element)
+    if insert_pos is not None:
+        target_slide.shapes._spTree.insert(insert_pos, el)
+    else:
+        target_slide.shapes._spTree.append(el)
+
+    rids = _get_shape_image_rids(shape._element)
+    for rid in rids:
+        try:
+            rel = ref_slide.part.rels[rid]
+        except KeyError:
+            continue
+        if not hasattr(rel, 'target_part'):
+            continue
+        new_rid = target_slide.part.relate_to(rel.target_part, rel.reltype)
+        if new_rid != rid:
+            for blip in el.iter(qn('a:blip')):
+                if blip.get(qn('r:embed')) == rid:
+                    blip.set(qn('r:embed'), new_rid)
+                if blip.get(qn('r:link')) == rid:
+                    blip.set(qn('r:link'), new_rid)
+
+
 def _copy_assets(slide, bg_name, include_logo=True):
-    """Copy background image and logo from reference template."""
+    """Copy background image and logo from reference template with proper image embedding."""
     ref = _get_ref()
     if ref is None:
         return
@@ -80,24 +124,10 @@ def _copy_assets(slide, bg_name, include_logo=True):
         found_logo = False
         for shape in ref_slide.shapes:
             if shape.name == bg_name and not found_bg:
-                el = copy.deepcopy(shape._element)
-                slide.shapes._spTree.insert(2, el)
-                for rel in ref_slide.part.rels.values():
-                    if hasattr(rel, 'target_part'):
-                        try:
-                            slide.part.relate_to(rel.target_part, rel.reltype, rel.rId)
-                        except:
-                            pass
+                _copy_shape_with_images(shape, ref_slide, slide, insert_pos=2)
                 found_bg = True
             if include_logo and shape.name == LOGO_NAME and not found_logo:
-                el = copy.deepcopy(shape._element)
-                slide.shapes._spTree.append(el)
-                for rel in ref_slide.part.rels.values():
-                    if hasattr(rel, 'target_part'):
-                        try:
-                            slide.part.relate_to(rel.target_part, rel.reltype, rel.rId)
-                        except:
-                            pass
+                _copy_shape_with_images(shape, ref_slide, slide)
                 found_logo = True
         if found_bg:
             break
@@ -420,25 +450,11 @@ def build_cover(prs, data):
         ref_slide = ref.slides[2]
         for shape in ref_slide.shapes:
             if "背景" in shape.name or "background" in shape.name.lower():
-                el = copy.deepcopy(shape._element)
-                slide.shapes._spTree.insert(2, el)
-                for rel in ref_slide.part.rels.values():
-                    if hasattr(rel, 'target_part'):
-                        try:
-                            slide.part.relate_to(rel.target_part, rel.reltype, rel.rId)
-                        except:
-                            pass
+                _copy_shape_with_images(shape, ref_slide, slide, insert_pos=2)
                 break
         for shape in ref_slide.shapes:
             if "logo" in shape.name.lower() and "dify" in shape.name.lower():
-                el = copy.deepcopy(shape._element)
-                slide.shapes._spTree.append(el)
-                for rel in ref_slide.part.rels.values():
-                    if hasattr(rel, 'target_part'):
-                        try:
-                            slide.part.relate_to(rel.target_part, rel.reltype, rel.rId)
-                        except:
-                            pass
+                _copy_shape_with_images(shape, ref_slide, slide)
                 break
 
     title = data.get("title", "")
