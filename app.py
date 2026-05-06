@@ -1,17 +1,16 @@
 import os
 import json
 import uuid
-import base64
-import subprocess
 import logging
-from datetime import datetime
-from flask import Flask, request, jsonify, send_file, render_template_string
+from flask import Flask, request, jsonify, send_from_directory, render_template_string
+from werkzeug.utils import secure_filename
 from anthropic import Anthropic
 from builder import build_from_json
 from pptx import Presentation as ReadPptx
 import memory_store
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 client = Anthropic()
 memory_store.init_db()
 
@@ -23,6 +22,18 @@ app.logger.addHandler(file_handler)
 app.logger.setLevel(logging.INFO)
 
 sessions = {}
+
+
+class ExtractionError(Exception):
+    """Raised when an uploaded document cannot provide usable slide content."""
+
+
+def _short_error(message: str) -> str:
+    return (
+        message
+        + "\n\nNo PPT was generated, so the error message will not become slide content. "
+        + "If this is a scanned PDF, upload a screenshot/image or paste the comparison text."
+    )
 
 SYSTEM_PROMPT = """You are a Dify PPT slide generator. You output ONLY valid JSON (no markdown, no explanation).
 
@@ -193,35 +204,41 @@ def extract_pptx_text(filepath):
         if slide_texts:
             lines.append(f"[Slide {i+1}]")
             lines.extend(slide_texts)
-    return "\n".join(lines)
+    text = "\n".join(lines).strip()
+    if not text:
+        raise ExtractionError("I could not find readable text in that PowerPoint file.")
+    return text
 
 
 def extract_pdf_text(filepath):
     try:
-        result = subprocess.run(
-            ["python3", "-c", f"""
-import sys
-try:
-    import pdfplumber
-    with pdfplumber.open("{filepath}") as pdf:
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if text:
-                print(f"[Page {{i+1}}]")
-                print(text)
-except ImportError:
-    print("[PDF text extraction requires pdfplumber. Install with: pip3 install pdfplumber]")
-"""],
-            capture_output=True, text=True, timeout=30
-        )
-        return result.stdout or "[Could not extract text from PDF. Try uploading as image/screenshot instead.]"
-    except Exception:
-        return "[Could not extract text from PDF. Try uploading as image/screenshot instead.]"
+        import pdfplumber
+    except ImportError as exc:
+        raise ExtractionError("PDF extraction is not available because pdfplumber is not installed.") from exc
+
+    lines = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = (page.extract_text(x_tolerance=1, y_tolerance=3) or "").strip()
+                if text:
+                    lines.append(f"[Page {i + 1}]")
+                    lines.append(text)
+    except Exception as exc:
+        raise ExtractionError(f"PDF text extraction failed: {exc}") from exc
+
+    text = "\n".join(lines).strip()
+    if not text:
+        raise ExtractionError("PDF text extraction found no readable text.")
+    return text
 
 
 def extract_text_file(filepath):
     with open(filepath, 'r', errors='ignore') as f:
-        return f.read()[:10000]
+        text = f.read()[:10000].strip()
+    if not text:
+        raise ExtractionError("That file did not contain readable text.")
+    return text
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -593,19 +610,55 @@ def chat_file_api():
         if uploaded:
             upload_dir = os.path.join(os.path.dirname(__file__), 'output', 'uploads')
             os.makedirs(upload_dir, exist_ok=True)
-            filename = f"{uuid.uuid4().hex[:8]}_{uploaded.filename}"
+            original_filename = secure_filename(uploaded.filename or "upload") or "upload"
+            filename = f"{uuid.uuid4().hex[:8]}_{original_filename}"
             filepath = os.path.join(upload_dir, filename)
             uploaded.save(filepath)
 
-            ext = os.path.splitext(uploaded.filename)[1].lower()
-            if ext == '.pptx':
-                extracted_text = extract_pptx_text(filepath)
-            elif ext == '.pdf':
-                extracted_text = extract_pdf_text(filepath)
-            elif ext in ('.txt', '.md', '.csv'):
-                extracted_text = extract_text_file(filepath)
-            else:
-                extracted_text = f"[Unsupported file type: {ext}. Supported: .pptx, .pdf, .txt, .md]"
+            ext = os.path.splitext(original_filename)[1].lower()
+            try:
+                if ext == '.pptx':
+                    extracted_text = extract_pptx_text(filepath)
+                elif ext == '.pdf':
+                    extracted_text = extract_pdf_text(filepath)
+                elif ext in ('.txt', '.md', '.csv'):
+                    extracted_text = extract_text_file(filepath)
+                else:
+                    raise ExtractionError(f"Unsupported file type: {ext or 'unknown'}. Supported: .pptx, .pdf, .txt, .md, .csv.")
+            except ExtractionError as e:
+                app.logger.warning(f"[chat-file] EXTRACT_ERR session={session_id} file={original_filename} error={e}")
+                memory_store.record_event(
+                    session_id=session_id,
+                    endpoint="chat-file",
+                    has_image=False,
+                    message_preview=message,
+                    success=False,
+                    error_type="extract",
+                    error_detail=str(e),
+                )
+                return jsonify({
+                    "reply": _short_error(str(e)),
+                    "file_url": None,
+                    "session_id": session_id,
+                })
+
+        if uploaded and not extracted_text.strip():
+            msg = "I could not extract enough readable content from that file."
+            app.logger.warning(f"[chat-file] EXTRACT_EMPTY session={session_id} file={uploaded.filename if uploaded else 'none'}")
+            memory_store.record_event(
+                session_id=session_id,
+                endpoint="chat-file",
+                has_image=False,
+                message_preview=message,
+                success=False,
+                error_type="extract_empty",
+                error_detail=msg,
+            )
+            return jsonify({
+                "reply": _short_error(msg),
+                "file_url": None,
+                "session_id": session_id,
+            })
 
         full_message = message
         if extracted_text:
@@ -727,10 +780,11 @@ def batch_api():
 
         upload_dir = os.path.join(os.path.dirname(__file__), 'output', 'uploads')
         os.makedirs(upload_dir, exist_ok=True)
-        tmp_name = f"{uuid.uuid4().hex[:8]}_{uploaded.filename}"
+        original_filename = secure_filename(uploaded.filename or "upload.pptx") or "upload.pptx"
+        tmp_name = f"{uuid.uuid4().hex[:8]}_{original_filename}"
         tmp_path = os.path.join(upload_dir, tmp_name)
         uploaded.save(tmp_path)
-        app.logger.info(f"[batch] file={uploaded.filename}")
+        app.logger.info(f"[batch] file={original_filename}")
 
         src = ReadPptx(tmp_path)
         slide_texts = []
@@ -745,6 +799,11 @@ def batch_api():
             slide_texts.append(f"[Slide {i+1}]\n" + "\n".join(texts))
 
         all_content = "\n\n".join(slide_texts)
+        if not all_content.strip():
+            return jsonify({
+                "reply": _short_error("I could not find readable text in that PowerPoint file."),
+                "file_url": None,
+            })
 
         prompt = (
             f"Below is a {len(src.slides)}-slide presentation. "
@@ -821,9 +880,11 @@ def batch_api():
 
 @app.route('/download/<filename>')
 def download(filename):
-    path = os.path.join(os.path.dirname(__file__), 'output', filename)
-    if os.path.exists(path):
-        return send_file(path, as_attachment=True)
+    safe_name = secure_filename(filename)
+    output_dir = os.path.join(os.path.dirname(__file__), 'output')
+    path = os.path.join(output_dir, safe_name)
+    if safe_name and os.path.exists(path):
+        return send_from_directory(output_dir, safe_name, as_attachment=True)
     return "File not found", 404
 
 
